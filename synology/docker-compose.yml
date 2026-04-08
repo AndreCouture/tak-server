@@ -1,0 +1,42 @@
+version: "3.8"
+# FreeTAKServer 2.x + MediaMTX on Synology NAS
+#
+# Synology Container Manager (DSM 7.2+):
+#   1. Container Manager → Project → Create
+#   2. Name: tak-server  |  Path: /docker/tak-server
+#   3. Paste this file → Deploy
+#
+# OR via SSH:
+#   cd /volume1/docker/tak-server && sudo docker-compose up -d
+
+services:
+  fts:
+    image: freetakteam/freetakserver:latest
+    container_name: freetakserver
+    restart: unless-stopped
+    ports:
+      - "8087:8087"    # CoT TCP (unencrypted)
+      - "8089:8089"    # CoT TLS
+      - "8443:8443"    # Marti API HTTPS
+      - "8446:8446"    # CSR — client cert enrollment
+      - "19023:19023"  # FTS REST API
+    volumes:
+      - ./fts-data:/opt/FTSData
+    environment:
+      # FTS 2.x reads these on first boot to write FTSConfig.yaml.
+      # After first run edit ./fts-data/FTSConfig.yaml directly.
+      FTS_COT_PORT: "8087"
+      FTS_SSLCOT_PORT: "8089"
+      FTS_API_PORT: "19023"
+      FTS_MARTI_PORT: "8443"
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx
+    restart: unless-stopped
+    ports:
+      - "1935:1935"    # RTMP video ingest
+      - "8554:8554"    # RTSP video playback
+      - "8888:8888"    # HLS video playback
+    environment:
+      MTX_PROTOCOLS: tcp

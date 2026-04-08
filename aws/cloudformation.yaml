@@ -1,0 +1,417 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FreeTAKServer 2.x — Minimal cost deployment for testing TAK Can.
+  FTS 2.x (official Docker image) + MediaMTX (video) on a single t3.micro.
+  ~$8/mo running, ~$2/mo stopped (EBS + EIP).
+  Stop/start: aws ec2 stop-instances / start-instances
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH key pair for EC2 access
+
+  AllowedIP:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR for SSH + management access (set to your IP/32 for security)
+
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 hosted zone ID for takaware.ca
+
+  DomainName:
+    Type: String
+    Default: tak.takaware.ca
+    Description: Subdomain for TAK server
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the EC2 instance
+
+  FTSImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      FreeTAKServer Docker image tag from freetakteam/freetakserver.
+      Use 'latest' or a specific version tag (e.g. '2.1.0').
+
+Resources:
+
+  # --- Security Group ---
+  TakServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: TAK Server ports
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # SSH
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedIP
+          Description: SSH
+        # Let's Encrypt HTTP challenge
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP - Lets Encrypt challenge
+        # CoT
+        - IpProtocol: tcp
+          FromPort: 8087
+          ToPort: 8087
+          CidrIp: 0.0.0.0/0
+          Description: CoT TCP (unencrypted)
+        - IpProtocol: tcp
+          FromPort: 8089
+          ToPort: 8089
+          CidrIp: 0.0.0.0/0
+          Description: CoT TLS
+        - IpProtocol: udp
+          FromPort: 6969
+          ToPort: 6969
+          CidrIp: 0.0.0.0/0
+          Description: CoT UDP multicast
+        # Marti API
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 0.0.0.0/0
+          Description: Marti HTTPS API
+        - IpProtocol: tcp
+          FromPort: 8446
+          ToPort: 8446
+          CidrIp: 0.0.0.0/0
+          Description: CSR HTTPS (client cert enrollment)
+        # FTS REST API — admin only
+        - IpProtocol: tcp
+          FromPort: 19023
+          ToPort: 19023
+          CidrIp: !Ref AllowedIP
+          Description: FTS REST API (admin only)
+        # Video
+        - IpProtocol: tcp
+          FromPort: 1935
+          ToPort: 1935
+          CidrIp: 0.0.0.0/0
+          Description: RTMP video ingest
+        - IpProtocol: tcp
+          FromPort: 8554
+          ToPort: 8554
+          CidrIp: 0.0.0.0/0
+          Description: RTSP video playback
+        - IpProtocol: tcp
+          FromPort: 8888
+          ToPort: 8888
+          CidrIp: 0.0.0.0/0
+          Description: HLS video playback
+
+  # --- IAM Role (SSM access — manage without SSH) ---
+  TakServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  TakServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref TakServerRole]
+
+  # --- Elastic IP ---
+  TakServerEIP:
+    Type: AWS::EC2::EIP
+
+  TakServerEIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref TakServer
+      AllocationId: !GetAtt TakServerEIP.AllocationId
+
+  # --- DNS Record ---
+  TakServerDNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      TTL: 300
+      ResourceRecords:
+        - !Ref TakServerEIP
+
+  # --- EC2 Instance ---
+  # NOTE: Using t3.micro (x86_64) — FTS 2.x official Docker image does not
+  # publish ARM64 (arm64/v8) images, so t4g (Graviton) will fail to start.
+  # Switch to t4g.micro + update AMI map if a multi-arch image is released.
+  TakServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref TakServerInstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref TakServerSG]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: tak-server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+
+          # Install Docker + tools
+          yum update -y
+          yum install -y docker certbot qrencode
+          systemctl enable docker && systemctl start docker
+          usermod -aG docker ec2-user
+
+          # Docker Compose v2 plugin
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -sL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+          # Compatibility shim for legacy 'docker-compose' calls
+          ln -sf /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+
+          # Let's Encrypt certificate for Marti API TLS
+          DOMAIN="${DomainName}"
+          certbot certonly --standalone --non-interactive --agree-tos \
+            --email admin@takaware.ca -d "$DOMAIN"
+
+          # Auto-renew cron
+          echo "0 3 * * * root certbot renew --quiet --post-hook 'docker compose -f /opt/tak-server/docker-compose.yml restart fts'" \
+            > /etc/cron.d/certbot-renew
+
+          # TAK server directory
+          mkdir -p /opt/tak-server/fts-data
+
+          # FTS 2.x uses the official freetakteam/freetakserver image.
+          # No pip install — the image bundles the server and all dependencies.
+          cat > /opt/tak-server/docker-compose.yml << 'EOF'
+          version: "3.8"
+          services:
+            fts:
+              image: freetakteam/freetakserver:${FTSImageTag}
+              container_name: freetakserver
+              restart: unless-stopped
+              network_mode: host
+              volumes:
+                - ./fts-data:/opt/FTSData
+                - /etc/letsencrypt:/etc/letsencrypt:ro
+              environment:
+                # FTS 2.x reads these on first boot to configure itself.
+                # After first run, edit /opt/FTSData/FTSConfig.yaml directly.
+                FTS_COT_PORT: "8087"
+                FTS_SSLCOT_PORT: "8089"
+                FTS_API_PORT: "19023"
+                FTS_MARTI_PORT: "8443"
+
+            mediamtx:
+              image: bluenviron/mediamtx:latest
+              container_name: mediamtx
+              restart: unless-stopped
+              network_mode: host
+              environment:
+                MTX_PROTOCOLS: tcp
+          EOF
+
+          cd /opt/tak-server && docker compose up -d
+
+          # Generate server QR codes after FTS is healthy
+          OUT=/opt/tak-server/clients
+          mkdir -p $OUT
+          (
+            # Wait up to 5 minutes for FTS Marti API to respond
+            for i in $(seq 1 30); do
+              curl -sk "https://localhost:8443" >/dev/null 2>&1 && break
+              sleep 10
+            done
+
+            # iTAK / TAK Can QR format: name,host,port,protocol
+            CONFIG="TAK Can,$DOMAIN,8089,ssl"
+
+            for callsign in ALPHA-1 BRAVO-1 CHARLIE-1 DELTA-1 ECHO-1; do
+              slug=$(echo "$callsign" | tr '[:upper:]' '[:lower:]')
+              printf '%s' "$CONFIG" > "$OUT/config-${!slug}.txt"
+              qrencode -o "$OUT/qr-${!slug}.png" -s 8 -l H < "$OUT/config-${!slug}.txt"
+            done
+
+            printf '%s' "$CONFIG" > "$OUT/server-config.txt"
+            qrencode -o "$OUT/server-qr.png" -s 8 -l H "$CONFIG"
+          ) &
+
+          # Systemd service for auto-start on reboot
+          cat > /etc/systemd/system/tak-server.service << 'SVC'
+          [Unit]
+          Description=TAK Server (FTS + MediaMTX)
+          After=docker.service
+          Requires=docker.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          WorkingDirectory=/opt/tak-server
+          ExecStart=/usr/local/bin/docker-compose up -d
+          ExecStop=/usr/local/bin/docker-compose down
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+          systemctl enable tak-server
+
+  # --- Auto-Stop Lambda (stop after 2h of no traffic) ---
+  AutoStopRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2StopDescribe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+
+  AutoStopFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tak-server-auto-stop
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt AutoStopRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref TakServer
+      Code:
+        ZipFile: |
+          import boto3, os, datetime
+
+          def handler(event, context):
+              ec2 = boto3.client('ec2')
+              cw  = boto3.client('cloudwatch')
+              iid = os.environ['INSTANCE_ID']
+
+              r = ec2.describe_instances(InstanceIds=[iid])
+              state = r['Reservations'][0]['Instances'][0]['State']['Name']
+              if state != 'running':
+                  return {'status': 'already stopped'}
+
+              end   = datetime.datetime.utcnow()
+              start = end - datetime.timedelta(hours=2)
+              m = cw.get_metric_statistics(
+                  Namespace='AWS/EC2', MetricName='NetworkIn',
+                  Dimensions=[{'Name': 'InstanceId', 'Value': iid}],
+                  StartTime=start, EndTime=end,
+                  Period=7200, Statistics=['Sum']
+              )
+              # < 1 MB in 2h = no real TAK connections
+              total = sum(d['Sum'] for d in m['Datapoints'])
+              if total < 1_000_000:
+                  ec2.stop_instances(InstanceIds=[iid])
+                  return {'status': 'stopped', 'network_bytes': total}
+              return {'status': 'active', 'network_bytes': total}
+
+  AutoStopSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Check TAK server activity every 2 hours
+      ScheduleExpression: rate(2 hours)
+      Targets:
+        - Arn: !GetAtt AutoStopFunction.Arn
+          Id: AutoStopTarget
+
+  AutoStopPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoStopFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoStopSchedule.Arn
+
+# --- AMI Map (AL2023 x86_64) ---
+Mappings:
+  RegionAMI:
+    ca-central-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    us-east-1:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    us-west-2:
+      AMI: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Outputs:
+  ServerIP:
+    Value: !Ref TakServerEIP
+    Description: TAK Server public IP
+
+  ServerDomain:
+    Value: !Ref DomainName
+    Description: TAK Server domain name
+
+  InstanceId:
+    Value: !Ref TakServer
+    Description: Instance ID for stop/start
+
+  CoTTCP:
+    Value: !Sub "${DomainName}:8087"
+    Description: CoT TCP endpoint (unencrypted)
+
+  CoTTLS:
+    Value: !Sub "${DomainName}:8089"
+    Description: CoT TLS endpoint
+
+  MartiAPI:
+    Value: !Sub "https://${DomainName}:8443"
+    Description: Marti API (Let's Encrypt TLS)
+
+  CSRAPI:
+    Value: !Sub "https://${DomainName}:8446"
+    Description: CSR endpoint for client cert enrollment
+
+  FTSRestAPI:
+    Value: !Sub "http://${DomainName}:19023"
+    Description: FTS REST API (admin — restricted by AllowedIP)
+
+  RTMPIngest:
+    Value: !Sub "rtmp://${DomainName}:1935/live"
+    Description: RTMP video push URL
+
+  RTSPPlayback:
+    Value: !Sub "rtsp://${DomainName}:8554/live"
+    Description: RTSP video playback URL
+
+  StopServer:
+    Value: !Sub "aws ec2 stop-instances --instance-ids ${TakServer} --region ${AWS::Region}"
+    Description: Stop server to save costs (~$2/mo stopped)
+
+  StartServer:
+    Value: !Sub "aws ec2 start-instances --instance-ids ${TakServer} --region ${AWS::Region}"
+    Description: Start server
