@@ -281,6 +281,9 @@ Resources:
             nginx-proxy:
               volumes:
                 - /etc/letsencrypt:/etc/letsencrypt:ro
+              depends_on:
+                ots-webui:
+                  condition: service_started
             ots-webui:
               container_name: opentakserver-webui
               restart: unless-stopped
