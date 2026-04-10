@@ -227,7 +227,20 @@ Resources:
 
           # Install Docker + tools
           dnf update -y
-          dnf install -y docker git qrencode cronie python3-pip augeas-libs jq
+          dnf install -y docker git qrencode cronie python3-pip augeas-libs jq amazon-cloudwatch-agent
+          # Configure Docker to ship all container logs to CloudWatch before starting
+          mkdir -p /etc/docker
+          cat > /etc/docker/daemon.json << 'DOCKEREOF'
+          {
+            "log-driver": "awslogs",
+            "log-opts": {
+              "awslogs-region": "${AWS::Region}",
+              "awslogs-group": "/tak-server/docker",
+              "awslogs-create-group": "true",
+              "tag": "{{.Name}}"
+            }
+          }
+          DOCKEREOF
           systemctl enable docker && systemctl start docker
           systemctl enable crond && systemctl start crond
           usermod -aG docker ec2-user
@@ -316,8 +329,8 @@ Resources:
           ENVEOF
           chmod 600 ots_config.env
 
-          # Install and configure CloudWatch agent
-          dnf install -y amazon-cloudwatch-agent
+          # Configure and start CloudWatch agent (system logs + host metrics).
+          # Docker container logs go via awslogs driver configured in daemon.json above.
           cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
           {
             "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
@@ -330,13 +343,6 @@ Resources:
                       "log_group_name": "/tak-server/system",
                       "log_stream_name": "{instance_id}/messages",
                       "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/var/lib/docker/containers/**/*-json.log",
-                      "log_group_name": "/tak-server/docker",
-                      "log_stream_name": "{instance_id}/{hostname}",
-                      "timezone": "UTC",
-                      "multi_line_start_pattern": "^\\{"
                     }
                   ]
                 }
