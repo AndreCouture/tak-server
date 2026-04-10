@@ -331,36 +331,39 @@ Resources:
 
           # Configure and start CloudWatch agent (system logs + host metrics).
           # Docker container logs go via awslogs driver configured in daemon.json above.
-          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
-          {
-            "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
-            "logs": {
-              "logs_collected": {
-                "files": {
-                  "collect_list": [
-                    {
-                      "file_path": "/var/log/messages",
-                      "log_group_name": "/tak-server/system",
-                      "log_stream_name": "{instance_id}/messages",
-                      "timezone": "UTC"
-                    }
-                  ]
-                }
-              }
-            },
-            "metrics": {
-              "namespace": "TAKServer",
-              "metrics_collected": {
-                "cpu":  { "measurement": ["cpu_usage_active"], "metrics_collection_interval": 60 },
-                "mem":  { "measurement": ["mem_used_percent"],  "metrics_collection_interval": 60 },
-                "disk": { "measurement": ["disk_used_percent"], "resources": ["/"], "metrics_collection_interval": 60 }
-              }
-            }
-          }
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.yaml << 'CWEOF'
+          agent:
+            metrics_collection_interval: 60
+            run_as_user: root
+          logs:
+            logs_collected:
+              files:
+                collect_list:
+                  - file_path: /var/log/messages
+                    log_group_name: /tak-server/system
+                    log_stream_name: "{instance_id}/messages"
+                    timezone: UTC
+          metrics:
+            namespace: TAKServer
+            metrics_collected:
+              cpu:
+                measurement:
+                  - cpu_usage_active
+                metrics_collection_interval: 60
+              mem:
+                measurement:
+                  - mem_used_percent
+                metrics_collection_interval: 60
+              disk:
+                measurement:
+                  - disk_used_percent
+                resources:
+                  - /
+                metrics_collection_interval: 60
           CWEOF
           /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
             -a fetch-config -m ec2 -s \
-            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.yaml
 
           # Start OTS stack.
           # First run builds the ots and nginx-proxy images (~5-10 mins).
