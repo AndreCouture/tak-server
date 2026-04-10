@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  FreeTAKServer 2.x — Minimal cost deployment for testing TAK Can.
-  FTS 2.x (official Docker image) + MediaMTX (video) on a single t3.micro.
-  ~$8/mo running, ~$2/mo stopped (EBS + EIP).
+  OpenTAKServer — Minimal cost deployment for testing TAK Can.
+  OTS (official Docker stack) + MediaMTX (video) on a single t3.small.
+  ~$17/mo running, ~$2/mo stopped (EBS + EIP).
   Stop/start: aws ec2 stop-instances / start-instances
 
 Parameters:
@@ -32,13 +32,6 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
     Description: Public subnet for the EC2 instance
 
-  FTSImageTag:
-    Type: String
-    Default: latest
-    Description: >
-      FreeTAKServer Docker image tag from freetakteam/freetakserver.
-      Use 'latest' or a specific version tag (e.g. '2.1.0').
-
 Resources:
 
   # --- Security Group ---
@@ -54,16 +47,28 @@ Resources:
           ToPort: 22
           CidrIp: !Ref AllowedIP
           Description: SSH
-        # Let's Encrypt HTTP challenge
+        # Let's Encrypt HTTP challenge + redirect
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
           Description: HTTP - Lets Encrypt challenge
+        # HTTPS Web UI
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS Web UI
+        # Data Package / HTTP API (proxied by nginx)
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          Description: HTTP API (nginx proxy)
         # CoT
         - IpProtocol: tcp
-          FromPort: 8087
-          ToPort: 8087
+          FromPort: 8088
+          ToPort: 8088
           CidrIp: 0.0.0.0/0
           Description: CoT TCP (unencrypted)
         - IpProtocol: tcp
@@ -76,23 +81,23 @@ Resources:
           ToPort: 6969
           CidrIp: 0.0.0.0/0
           Description: CoT UDP multicast
-        # Marti API
+        # Marti / OTS API
         - IpProtocol: tcp
           FromPort: 8443
           ToPort: 8443
           CidrIp: 0.0.0.0/0
-          Description: Marti HTTPS API
+          Description: HTTPS API (nginx proxy)
         - IpProtocol: tcp
           FromPort: 8446
           ToPort: 8446
           CidrIp: 0.0.0.0/0
           Description: CSR HTTPS (client cert enrollment)
-        # FTS REST API — admin only
+        # MQTT / Meshtastic
         - IpProtocol: tcp
-          FromPort: 19023
-          ToPort: 19023
-          CidrIp: !Ref AllowedIP
-          Description: FTS REST API (admin only)
+          FromPort: 8883
+          ToPort: 8883
+          CidrIp: 0.0.0.0/0
+          Description: MQTTS (Meshtastic)
         # Video
         - IpProtocol: tcp
           FromPort: 1935
@@ -109,8 +114,27 @@ Resources:
           ToPort: 8888
           CidrIp: 0.0.0.0/0
           Description: HLS video playback
+        - IpProtocol: tcp
+          FromPort: 8889
+          ToPort: 8889
+          CidrIp: 0.0.0.0/0
+          Description: WebRTC video
+        # MediaMTX admin API — restricted to AllowedIP
+        - IpProtocol: tcp
+          FromPort: 9997
+          ToPort: 9997
+          CidrIp: !Ref AllowedIP
+          Description: MediaMTX admin API (admin only)
 
-  # --- IAM Role (SSM access — manage without SSH) ---
+  # --- Secrets Manager — OTS admin credentials ---
+  TakAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/tak-admin"
+      Description: OTS administrator credentials (password rotated on first boot)
+      SecretString: '{"username":"administrator","password":"placeholder"}'
+
+  # --- IAM Role (SSM + Route53 for certbot DNS-01 challenge + Secrets Manager) ---
   TakServerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -123,6 +147,29 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CertbotRoute53
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:ListHostedZones
+                  - route53:GetChange
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                Resource: !Sub "arn:aws:route53:::hostedzone/${HostedZoneId}"
+        - PolicyName: TakAdminSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref TakAdminSecret
 
   TakServerInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -151,13 +198,13 @@ Resources:
         - !Ref TakServerEIP
 
   # --- EC2 Instance ---
-  # NOTE: Using t3.micro (x86_64) — FTS 2.x official Docker image does not
-  # publish ARM64 (arm64/v8) images, so t4g (Graviton) will fail to start.
-  # Switch to t4g.micro + update AMI map if a multi-arch image is released.
+  # NOTE: Using t3.small (x86_64, 2GB RAM) — OTS runs PostgreSQL + RabbitMQ +
+  # multiple Python services + nginx which requires ~1.5GB RAM minimum.
+  # OTS does not publish ARM64 images so t4g (Graviton) will fail.
   TakServer:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t3.micro
+      InstanceType: t3.small
       ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
       KeyName: !Ref KeyPairName
       IamInstanceProfile: !Ref TakServerInstanceProfile
@@ -178,12 +225,13 @@ Resources:
           set -ex
 
           # Install Docker + tools
-          yum update -y
-          yum install -y docker certbot qrencode
+          dnf update -y
+          dnf install -y docker git qrencode cronie python3-pip augeas-libs jq
           systemctl enable docker && systemctl start docker
+          systemctl enable crond && systemctl start crond
           usermod -aG docker ec2-user
 
-          # Docker Compose v2 plugin
+          # Docker Compose v2 + buildx plugins (OTS requires buildx 0.17.0+)
           mkdir -p /usr/local/lib/docker/cli-plugins
           curl -sL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
             -o /usr/local/lib/docker/cli-plugins/docker-compose
@@ -191,77 +239,92 @@ Resources:
           # Compatibility shim for legacy 'docker-compose' calls
           ln -sf /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
 
-          # Let's Encrypt certificate for Marti API TLS
+          # Install latest buildx (AL2023 bundles an older version that OTS rejects)
+          BUILDX_VER=$(curl -s https://api.github.com/repos/docker/buildx/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+          curl -sL "https://github.com/docker/buildx/releases/download/${BUILDX_VER}/buildx-${BUILDX_VER}.linux-amd64" \
+            -o /usr/local/lib/docker/cli-plugins/docker-buildx
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+
+          # Install certbot with Route53 DNS plugin for browser-trusted TLS on port 443.
+          # DNS-01 challenge — no web server needed, uses IAM role for Route53 auth.
+          pip3 install certbot certbot-dns-route53
+
+          # Clone OpenTAKServer Docker repo (contains nginx/rabbitmq/mediamtx configs)
+          git clone https://github.com/brian7704/OpenTAKServer-Docker.git /opt/tak-server
+          cd /opt/tak-server
+
+          # --- Let's Encrypt cert (before OTS starts so nginx builds with correct config) ---
           DOMAIN="${DomainName}"
-          certbot certonly --standalone --non-interactive --agree-tos \
-            --email admin@takaware.ca -d "$DOMAIN"
+          certbot certonly \
+            --dns-route53 \
+            --non-interactive \
+            --agree-tos \
+            --email admin@takaware.ca \
+            -d "$DOMAIN"
 
-          # Auto-renew cron
-          echo "0 3 * * * root certbot renew --quiet --post-hook 'docker compose -f /opt/tak-server/docker-compose.yml restart fts'" \
-            > /etc/cron.d/certbot-renew
+          # Patch nginx port-443 template to use LE cert (browser trusted).
+          # Ports 8443/8446 keep the OTS self-signed cert + OTS CA for TAK mutual TLS.
+          sed -i 's|include includes.d/opentakserver_certificate;|include includes.d/letsencrypt_certificate;|' \
+            ots/configs/nginx/templates/https-443.conf.template
 
-          # TAK server directory
-          mkdir -p /opt/tak-server/fts-data
+          # Create the LE nginx include (baked into nginx image at build time)
+          cat > ots/configs/nginx/includes/letsencrypt_certificate << NGINXEOF
+          ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+          NGINXEOF
 
-          # FTS 2.x uses the official freetakteam/freetakserver image.
-          # No pip install — the image bundles the server and all dependencies.
-          cat > /opt/tak-server/docker-compose.yml << 'EOF'
-          version: "3.8"
+          # Mount host /etc/letsencrypt into nginx-proxy container.
+          # Also fix ots-webui container name: nginx upstream expects "opentakserver-webui"
+          # but the upstream compose uses "ots-webui".
+          cat > docker-compose.override.yml << 'OVERRIDEEOF'
           services:
-            fts:
-              image: freetakteam/freetakserver:${FTSImageTag}
-              container_name: freetakserver
-              restart: unless-stopped
-              network_mode: host
+            nginx-proxy:
               volumes:
-                - ./fts-data:/opt/FTSData
                 - /etc/letsencrypt:/etc/letsencrypt:ro
-              environment:
-                # FTS 2.x reads these on first boot to configure itself.
-                # After first run, edit /opt/FTSData/FTSConfig.yaml directly.
-                FTS_COT_PORT: "8087"
-                FTS_SSLCOT_PORT: "8089"
-                FTS_API_PORT: "19023"
-                FTS_MARTI_PORT: "8443"
-
-            mediamtx:
-              image: bluenviron/mediamtx:latest
-              container_name: mediamtx
+            ots-webui:
+              container_name: opentakserver-webui
               restart: unless-stopped
-              network_mode: host
-              environment:
-                MTX_PROTOCOLS: tcp
-          EOF
+          OVERRIDEEOF
 
-          cd /opt/tak-server && docker compose up -d
+          # AL2023 uses /etc/localtime, not /etc/timezone — remove the rabbitmq volume mount
+          sed -i '/\/etc\/timezone/d' docker-compose.yml
 
-          # Generate server QR codes after FTS is healthy
-          OUT=/opt/tak-server/clients
-          mkdir -p $OUT
-          (
-            # Wait up to 5 minutes for FTS Marti API to respond
-            for i in $(seq 1 30); do
-              curl -sk "https://localhost:8443" >/dev/null 2>&1 && break
-              sleep 10
-            done
+          # Pre-create data dirs with correct ownership for each container user:
+          #   ots container runs as ots (UID 1000 / GID 1024) — owns top-level ./ots
+          #   postgres container runs as postgres (UID 999) — owns ./ots/pgdata
+          mkdir -p ots/pgdata
+          chown 1000:1024 ots
+          chown 999:999 ots/pgdata
 
-            # iTAK / TAK Can QR format: name,host,port,protocol
-            CONFIG="TAK Can,$DOMAIN,8089,ssl"
+          # Generate secrets and write OTS config.
+          # OTS_FQDN is the public address advertised to TAK clients and used in TLS certs.
+          DB_PASSWORD=$(openssl rand -hex 16)
+          cat > ots_config.env << ENVEOF
+          SQLALCHEMY_DATABASE_URI=postgresql+psycopg://ots:$DB_PASSWORD@ots-db/ots
+          OTS_FQDN=${DomainName}
+          OTS_RABBITMQ_SERVER_ADDRESS=rabbitmq
+          OTS_LISTENER_ADDRESS=0.0.0.0
+          OTS_MEDIAMTX_API_ADDRESS=http://mediamtx:9997
+          POSTGRES_PASSWORD=$DB_PASSWORD
+          POSTGRES_USER=ots
+          POSTGRES_DB=ots
+          PGUSER=ots
+          ENVEOF
+          chmod 600 ots_config.env
 
-            for callsign in ALPHA-1 BRAVO-1 CHARLIE-1 DELTA-1 ECHO-1; do
-              slug=$(echo "$callsign" | tr '[:upper:]' '[:lower:]')
-              printf '%s' "$CONFIG" > "$OUT/config-${!slug}.txt"
-              qrencode -o "$OUT/qr-${!slug}.png" -s 8 -l H < "$OUT/config-${!slug}.txt"
-            done
+          # Start OTS stack.
+          # First run builds the ots and nginx-proxy images (~5-10 mins).
+          docker compose up -d
 
-            printf '%s' "$CONFIG" > "$OUT/server-config.txt"
-            qrencode -o "$OUT/server-qr.png" -s 8 -l H "$CONFIG"
-          ) &
+          # Certbot renewal cron — host certbot renews, then reloads nginx (daily 03:00)
+          cat > /etc/cron.d/certbot-renew << 'CRONEOF'
+          0 3 * * * root certbot renew --quiet --post-hook "docker compose -f /opt/tak-server/docker-compose.yml exec nginx-proxy nginx -s reload"
+          CRONEOF
 
           # Systemd service for auto-start on reboot
           cat > /etc/systemd/system/tak-server.service << 'SVC'
           [Unit]
-          Description=TAK Server (FTS + MediaMTX)
+          Description=TAK Server (OpenTAKServer)
           After=docker.service
           Requires=docker.service
           [Service]
@@ -274,6 +337,58 @@ Resources:
           WantedBy=multi-user.target
           SVC
           systemctl enable tak-server
+
+          # Bootstrap TLS (port 8089) + generate QR codes once OTS is healthy
+          OUT=/opt/tak-server/clients
+          mkdir -p $OUT
+          (
+            cd /opt/tak-server
+            DOMAIN="${DomainName}"
+            FLASK="/app/venv/bin/flask --app /app/venv/lib/python3.13/site-packages/opentakserver/app.py"
+
+            # Wait up to 10 minutes for OTS API to respond
+            for i in $(seq 1 60); do
+              curl -sk "https://localhost:8443/api/health" >/dev/null 2>&1 && break
+              sleep 10
+            done
+
+            # Ensure CA + server cert exist in the shared volume.
+            # OTS creates them on startup, but ots_eud_handler_ssl may have started
+            # before they were written. Running these is idempotent (no-op if exists).
+            docker exec opentakserver $FLASK ots create-ca || true
+            docker exec opentakserver $FLASK ots issue-server-certificate || true
+
+            # Restart SSL handler so it picks up certs cleanly (no more crash-loop)
+            docker compose restart ots_eud_handler_ssl
+
+            # Rotate default administrator password (default is 'password' — insecure)
+            ADMIN_PASS=$(openssl rand -hex 16)
+            TOKEN=$(curl -sk -X POST "https://localhost:8443/oauth/token" \
+              -d "username=administrator&password=password" | jq -r '.access_token')
+            curl -sk -X POST "https://localhost:8443/api/user/password/reset" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"username\":\"administrator\",\"new_password\":\"$ADMIN_PASS\"}" >/dev/null
+            aws secretsmanager put-secret-value \
+              --secret-id "${TakAdminSecret}" \
+              --secret-string "{\"username\":\"administrator\",\"password\":\"$ADMIN_PASS\"}" \
+              --region "${AWS::Region}"
+            # Local fallback — readable by root only
+            printf 'administrator:%s\n' "$ADMIN_PASS" > /opt/tak-server/admin-credentials.txt
+            chmod 600 /opt/tak-server/admin-credentials.txt
+
+            # iTAK / TAK Can QR format: name,host,port,protocol
+            CONFIG="TAK Can,$DOMAIN,8089,ssl"
+
+            for callsign in ALPHA-1 BRAVO-1 CHARLIE-1 DELTA-1 ECHO-1; do
+              slug=$(echo "$callsign" | tr '[:upper:]' '[:lower:]')
+              printf '%s' "$CONFIG" > "$OUT/config-$slug.txt"
+              qrencode -o "$OUT/qr-$slug.png" -s 8 -l H "$CONFIG"
+            done
+
+            printf '%s' "$CONFIG" > "$OUT/server-config.txt"
+            qrencode -o "$OUT/server-qr.png" -s 8 -l H "$CONFIG"
+          ) &
 
   # --- Auto-Stop Lambda (stop after 2h of no traffic) ---
   AutoStopRole:
@@ -381,24 +496,32 @@ Outputs:
     Description: Instance ID for stop/start
 
   CoTTCP:
-    Value: !Sub "${DomainName}:8087"
+    Value: !Sub "${DomainName}:8088"
     Description: CoT TCP endpoint (unencrypted)
 
   CoTTLS:
     Value: !Sub "${DomainName}:8089"
     Description: CoT TLS endpoint
 
-  MartiAPI:
+  AdminSecretArn:
+    Value: !Ref TakAdminSecret
+    Description: Secrets Manager ARN for OTS admin credentials
+
+  WebUI:
+    Value: !Sub "https://${DomainName}"
+    Description: OTS Web Admin UI — credentials in Secrets Manager (see AdminSecretArn output)
+
+  MediaMTXAdmin:
+    Value: !Sub "http://${DomainName}:9997"
+    Description: MediaMTX admin API (restricted to AllowedIP)
+
+  API:
     Value: !Sub "https://${DomainName}:8443"
-    Description: Marti API (Let's Encrypt TLS)
+    Description: OTS HTTPS API
 
   CSRAPI:
     Value: !Sub "https://${DomainName}:8446"
     Description: CSR endpoint for client cert enrollment
-
-  FTSRestAPI:
-    Value: !Sub "http://${DomainName}:19023"
-    Description: FTS REST API (admin — restricted by AllowedIP)
 
   RTMPIngest:
     Value: !Sub "rtmp://${DomainName}:1935/live"

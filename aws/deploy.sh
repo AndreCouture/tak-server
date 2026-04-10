@@ -22,7 +22,7 @@ aws cloudformation deploy \
     SubnetId="${TAK_SUBNET_ID:?Set TAK_SUBNET_ID}" \
     AllowedIP="${TAK_ALLOWED_IP:-0.0.0.0/0}" \
     DomainName="${TAK_DOMAIN:-tak.takaware.ca}" \
-    FTSImageTag="${TAK_FTS_TAG:-latest}"
+    FTSImageTag="${TAK_FTS_TAG:-master}"
 
 echo ""
 echo "Stack outputs:"

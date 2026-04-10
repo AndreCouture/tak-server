@@ -1,42 +1,179 @@
-version: "3.8"
-# FreeTAKServer 2.x + MediaMTX on Synology NAS
+# OpenTAKServer on Synology NAS
+#
+# OTS runs as a full microservices stack. The upstream repo contains
+# nginx/rabbitmq/mediamtx config files that must exist alongside this compose.
+#
+# Setup via SSH:
+#   cd /volume1/docker
+#   git clone https://github.com/brian7704/OpenTAKServer-Docker.git tak-server
+#   cd tak-server
+#   cp ots_config.env ots_config.env.bak
+#
+# Edit ots_config.env — set OTS_FQDN to your NAS IP or hostname, and change
+# POSTGRES_PASSWORD / SQLALCHEMY_DATABASE_URI to use a strong password:
+#   OTS_FQDN=192.168.1.x        # or your hostname
+#   POSTGRES_PASSWORD=changeme  # replace with a strong password
+#   SQLALCHEMY_DATABASE_URI=postgresql+psycopg://ots:changeme@ots-db/ots
+#
+# Start:
+#   docker compose up -d
 #
 # Synology Container Manager (DSM 7.2+):
-#   1. Container Manager → Project → Create
-#   2. Name: tak-server  |  Path: /docker/tak-server
-#   3. Paste this file → Deploy
+#   Container Manager → Project → Create
+#   Name: tak-server | Path: /docker/tak-server
+#   (use the cloned directory directly — do not copy files manually)
 #
-# OR via SSH:
-#   cd /volume1/docker/tak-server && sudo docker-compose up -d
+# IMPORTANT: Pre-create data dirs with correct ownership before first start:
+#   mkdir -p /volume1/docker/tak-server/ots/pgdata
+#   chown 1000:1024 /volume1/docker/tak-server/ots       # OTS user (UID 1000)
+#   chown 999:999   /volume1/docker/tak-server/ots/pgdata # postgres user (UID 999)
 
 services:
-  fts:
-    image: freetakteam/freetakserver:latest
-    container_name: freetakserver
+  ots:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opentakserver
+    hostname: opentakserver
+    restart: unless-stopped
+    tty: true
+    ports:
+      - "8081:8081"       # OTS internal HTTP (proxied by nginx)
+    volumes:
+      - "./ots:/app/ots:rw"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+    healthcheck:
+      test: curl --fail http://localhost:8081/api/health || exit 1
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    env_file: ots_config.env
+
+  ots_cot_parser:
+    image: ghcr.io/brian7704/ots_cot_parser:master
+    container_name: ots_cot_parser
+    restart: unless-stopped
+    tty: true
+    command: python3 /app/venv/bin/cot_parser
+    volumes:
+      - "./ots:/app/ots:rw"
+    depends_on:
+      ots:
+        condition: service_healthy
+    env_file: ots_config.env
+
+  ots_eud_handler:
+    image: ghcr.io/brian7704/ots_eud_handler:master
+    container_name: ots_eud_handler
+    restart: unless-stopped
+    tty: true
+    command: python3 /app/venv/bin/eud_handler
+    # Port 8088 (plain TCP) intentionally not published — use 8089 TLS only
+    volumes:
+      - "./ots:/app/ots:rw"
+    env_file: ots_config.env
+
+  ots_eud_handler_ssl:
+    image: ghcr.io/brian7704/ots_eud_handler_ssl:master
+    container_name: ots_eud_handler_ssl
+    # OTS auto-creates the CA + server cert on first startup. This container
+    # depends on OTS health, but may start before certs land on the volume.
+    # restart: unless-stopped means it will recover automatically once certs
+    # exist (usually within one restart). To force immediate recovery after
+    # first bring-up, run:
+    #   docker exec opentakserver /app/venv/bin/flask \
+    #     --app /app/venv/lib/python3.13/site-packages/opentakserver/app.py \
+    #     ots create-ca
+    #   docker exec opentakserver /app/venv/bin/flask \
+    #     --app /app/venv/lib/python3.13/site-packages/opentakserver/app.py \
+    #     ots issue-server-certificate
+    #   docker compose restart ots_eud_handler_ssl
+    restart: unless-stopped
+    tty: true
+    command: python3 /app/venv/bin/eud_handler --ssl
+    ports:
+      - "8089:8089"       # CoT TLS (mTLS — requires client cert from OTS CA)
+    volumes:
+      - "./ots:/app/ots"
+    env_file: ots_config.env
+    depends_on:
+      ots:
+        condition: service_healthy
+
+  ots-webui:
+    image: ghcr.io/brian7704/opentakserver-ui:master
+    container_name: opentakserver-webui
+    restart: unless-stopped
+
+  nginx-proxy:
+    build:
+      context: .
+      dockerfile: ots/configs/nginx/Dockerfile
+    container_name: nginx-proxy
     restart: unless-stopped
     ports:
-      - "8087:8087"    # CoT TCP (unencrypted)
-      - "8089:8089"    # CoT TLS
-      - "8443:8443"    # Marti API HTTPS
-      - "8446:8446"    # CSR — client cert enrollment
-      - "19023:19023"  # FTS REST API
+      - "80:80"           # HTTP / Let's Encrypt challenge
+      - "443:443"         # HTTPS Web UI
+      - "8080:8080"       # HTTP API
+      - "8443:8443"       # HTTPS API
+      - "8446:8446"       # CSR — client cert enrollment
+      - "8883:8883"       # MQTTS (Meshtastic)
     volumes:
-      - ./fts-data:/opt/FTSData
-    environment:
-      # FTS 2.x reads these on first boot to write FTSConfig.yaml.
-      # After first run edit ./fts-data/FTSConfig.yaml directly.
-      FTS_COT_PORT: "8087"
-      FTS_SSLCOT_PORT: "8089"
-      FTS_API_PORT: "19023"
-      FTS_MARTI_PORT: "8443"
+      - "./ots/ca:/app/ots/ca:ro"
+      - "./ots/configs/nginx/templates:/etc/nginx/templates:ro"
+      - ./ots/configs/nginx/letsencrypt/www:/var/www/certbot/:rw
+      - ./ots/configs/nginx/letsencrypt/certs/:/etc/letsencrypt/:rw
+    depends_on:
+      ots:
+        condition: service_healthy
+
+  certbot:
+    image: certbot/certbot:latest
+    volumes:
+      - ./ots/configs/nginx/letsencrypt/www:/var/www/certbot/:rw
+      - ./ots/configs/nginx/letsencrypt/certs/:/etc/letsencrypt/:rw
+
+  rabbitmq:
+    image: rabbitmq:latest
+    container_name: rabbitmq
+    restart: unless-stopped
+    volumes:
+      - "./ots/configs/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro"
+      - "./ots/configs/rabbitmq/99-opentakserver.conf:/etc/rabbitmq/conf.d/99-opentakserver.conf:ro"
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 30s
+      retries: 3
 
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    image: bluenviron/mediamtx:1.13.0-ffmpeg
     container_name: mediamtx
     restart: unless-stopped
     ports:
-      - "1935:1935"    # RTMP video ingest
-      - "8554:8554"    # RTSP video playback
-      - "8888:8888"    # HLS video playback
-    environment:
-      MTX_PROTOCOLS: tcp
+      - "1935:1935"       # RTMP video ingest
+      - "8554:8554"       # RTSP video playback
+      - "8888:8888"       # HLS video playback
+      - "8889:8889"       # WebRTC
+      - "9997:9997"       # MediaMTX admin API (restrict at firewall level)
+    volumes:
+      - "./ots:/app/ots"
+      - "./ots/mediamtx/mediamtx.yml:/mediamtx.yml"
+
+  ots-db:
+    image: postgis/postgis:18-3.6
+    container_name: ots-db
+    restart: unless-stopped
+    env_file: ots_config.env
+    volumes:
+      - "./ots/pgdata:/var/lib/postgresql"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
