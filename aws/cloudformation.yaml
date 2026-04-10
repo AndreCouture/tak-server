@@ -316,6 +316,46 @@ Resources:
           ENVEOF
           chmod 600 ots_config.env
 
+          # Install and configure CloudWatch agent
+          dnf install -y amazon-cloudwatch-agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+          {
+            "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/messages",
+                      "log_group_name": "/tak-server/system",
+                      "log_stream_name": "{instance_id}/messages",
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/var/lib/docker/containers/**/*-json.log",
+                      "log_group_name": "/tak-server/docker",
+                      "log_stream_name": "{instance_id}/{hostname}",
+                      "timezone": "UTC",
+                      "multi_line_start_pattern": "^\\{"
+                    }
+                  ]
+                }
+              }
+            },
+            "metrics": {
+              "namespace": "TAKServer",
+              "metrics_collected": {
+                "cpu":  { "measurement": ["cpu_usage_active"], "metrics_collection_interval": 60 },
+                "mem":  { "measurement": ["mem_used_percent"],  "metrics_collection_interval": 60 },
+                "disk": { "measurement": ["disk_used_percent"], "resources": ["/"], "metrics_collection_interval": 60 }
+              }
+            }
+          }
+          CWEOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
           # Start OTS stack.
           # First run builds the ots and nginx-proxy images (~5-10 mins).
           docker compose up -d
@@ -393,6 +433,19 @@ Resources:
             printf '%s' "$CONFIG" > "$OUT/server-config.txt"
             qrencode -o "$OUT/server-qr.png" -s 8 -l H "$CONFIG"
           ) &
+
+  # --- CloudWatch Log Groups ---
+  TakServerSystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /tak-server/system
+      RetentionInDays: 14
+
+  TakServerDockerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /tak-server/docker
+      RetentionInDays: 14
 
   # --- Auto-Stop Lambda (stop after 2h of no traffic) ---
   AutoStopRole:
